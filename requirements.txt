@@ -4,3 +4,4 @@ kociemba==1.2.1
 groq==0.13.0
 python-dotenv==1.0.1
 pydantic==2.10.3
+pydantic-core==2.27.1
