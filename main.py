@@ -4,19 +4,14 @@ CubeMeta Backend Solver API — v2.0
 ====================================
 FastAPI sunucusu; küp yüz verisi alarak Kociemba algoritmasıyla çözüm üretir
 ve Groq LLaMA modeli aracılığıyla AI ipuçları sağlar.
-
-Kurulum:
-    pip install fastapi uvicorn kociemba groq python-dotenv
-
-Çalıştırma:
-    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
 
 import os
 import logging
+import math  # _approx_rows için eklendi
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import kociemba
@@ -56,7 +51,7 @@ class SolveResponse(BaseModel):
 
 class AiHintRequest(BaseModel):
     moves: List[str]                # Çözüm hamlelerinin listesi
-    language: Optional[str] = "tr" # "tr" veya "en"
+    language: Optional[str] = "tr"  # "tr" veya "en"
 
 class AiHintResponse(BaseModel):
     hint: str
@@ -67,24 +62,28 @@ class AiHintResponse(BaseModel):
 def faces_to_kociemba_string(faces: List[List[str]]) -> str:
     """
     6 yüzlük renk tablosunu kociemba formatına çevirir.
-    Kociemba: 54 karakterli string — U(9) R(9) F(9) D(9) L(9) B(9)
-    Uygulama sırası: [0]=Ön [1]=Arka [2]=Sol [3]=Sağ [4]=Üst [5]=Alt
+    Kociemba sırası: U(Up) R(Right) F(Front) D(Down) L(Left) B(Back)
+    Senin uygulamanın gönderdiği sıra: [0]=Ön [1]=Arka [2]=Sol [3]=Sağ [4]=Üst [5]=Alt
     """
     front, back, left, right, top, bottom = faces
 
     # Merkez renkten yüz harfi eşleşmesi
-    color_to_face = {
-        top[4]:    'U',
-        right[4]:  'R',
-        front[4]:  'F',
-        bottom[4]: 'D',
-        left[4]:   'L',
-        back[4]:   'B',
-    }
+    try:
+        color_to_face = {
+            top[4]:    'U',
+            right[4]:  'R',
+            front[4]:  'F',
+            bottom[4]: 'D',
+            left[4]:   'L',
+            back[4]:   'B',
+        }
+    except IndexError:
+        raise ValueError("Yüz verileri eksik veya merkez kareler bulunamadı.")
 
     if len(color_to_face) != 6:
         raise ValueError("Yinelenen merkez rengi — geçersiz küp durumu")
 
+    # Kociemba algoritmasının beklediği özel yüz sırası (U R F D L B)
     kociemba_order = [top, right, front, bottom, left, back]
     result = ""
     for face in kociemba_order:
@@ -93,15 +92,11 @@ def faces_to_kociemba_string(faces: List[List[str]]) -> str:
                 raise ValueError(f"Bilinmeyen renk kodu: {sticker}")
             result += color_to_face[sticker]
 
-    if len(result) != 54:
-        raise ValueError(f"Geçersiz küp dizisi uzunluğu: {len(result)}")
-
     return result
 
 # ── Groq AI ───────────────────────────────────────────────────────────────────
 
 def get_groq_client() -> Optional[object]:
-    """Groq istemcisi oluştur — Render Environment Variables'dan GROQ_API_KEY okur."""
     if not GROQ_AVAILABLE:
         return None
     key = os.getenv("GROQ_API_KEY", "")
@@ -113,24 +108,17 @@ def get_groq_client() -> Optional[object]:
         return None
 
 def generate_ai_hint(moves: List[str], language: str = "tr") -> str:
-    """Groq LLaMA ile çözüm hakkında ipucu üret."""
     client = get_groq_client()
     if not client:
         return "Groq API anahtarı sunucuda tanımlı değil. Render Environment Variables'a GROQ_API_KEY ekleyin."
 
-    move_str = " → ".join(moves[:15])  # İlk 15 hamle
+    move_str = " → ".join(moves[:15])
     more = f" ... ve {len(moves) - 15} hamle daha" if len(moves) > 15 else ""
 
     if language == "tr":
-        prompt = f"""Bir Rubik Küp çözüm algoritması uzmanısın. Aşağıdaki çözüm adımlarını analiz et ve kullanıcıya Türkçe, kısa (3-4 cümle) ve anlaşılır bir ipucu ver. 
-Hamleler: {move_str}{more}
-Toplam hamle sayısı: {len(moves)}
-Yanıt yalnızca Türkçe olmalı ve pratik tavsiyeler içermeli."""
+        prompt = f"Rubik Küp çözüm uzmanısın. Şu hamleleri analiz et ve kısa (3-4 cümle) Türkçe ipucu ver: {move_str}{more}"
     else:
-        prompt = f"""You are a Rubik's Cube solving expert. Analyze the solution steps and provide a short (3-4 sentence) helpful hint.
-Moves: {move_str}{more}
-Total moves: {len(moves)}
-Reply in English with practical advice."""
+        prompt = f"You are a Rubik's Cube expert. Analyze these moves and give a short hint: {move_str}{more}"
 
     try:
         completion = client.chat.completions.create(
@@ -154,67 +142,41 @@ def root():
         "groq_available": GROQ_AVAILABLE and bool(os.getenv("GROQ_API_KEY"))
     }
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
 @app.post("/api/v1/solve", response_model=SolveResponse)
 def solve(request: SolveRequest):
-    logger.info(f"Çözüm isteği: {len(request.faces)} yüz, izgara={request.grid_size}")
-
     if len(request.faces) != 6:
         raise HTTPException(status_code=400, detail="Tam olarak 6 yüz gereklidir")
 
     grid_size = request.grid_size or 9
 
-    for i, face in enumerate(request.faces):
-        if len(face) != grid_size:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Yüz {i}: {grid_size} kare gerekli, {len(face)} geldi"
-            )
-
-    # Standart olmayan ızgara boyutu — merkez kare 3×3 alt kümesi al
+    # Izgara boyutu kontrolü ve gerekirse 3x3'e (9 kare) indirgeme
     working_faces = request.faces
     if grid_size != 9:
         try:
             working_faces = [extract_center_9(face, grid_size) for face in request.faces]
-            logger.info(f"Izgara {grid_size}→9'a indirgendt")
         except Exception as e:
-            return SolveResponse(solution=[], move_count=0, error=f"Izgara dönüşümü başarısız: {e}")
+            return SolveResponse(solution=[], move_count=0, error=f"Izgara dönüşümü hatası: {e}")
 
     try:
         cube_string = faces_to_kociemba_string(working_faces)
-        logger.info(f"Kociemba girdisi: {cube_string}")
         solution_str = kociemba.solve(cube_string)
         moves = solution_str.strip().split()
-        logger.info(f"Çözüm: {moves} ({len(moves)} hamle)")
         return SolveResponse(solution=moves, move_count=len(moves))
-    except ValueError as e:
-        logger.error(f"Doğrulama hatası: {e}")
-        return SolveResponse(solution=[], move_count=0, error=str(e))
     except Exception as e:
         logger.error(f"Çözücü hatası: {e}")
-        raise HTTPException(status_code=500, detail=f"Çözüm başarısız: {str(e)}")
+        return SolveResponse(solution=[], move_count=0, error=str(e))
 
 @app.post("/api/v1/ai-hint", response_model=AiHintResponse)
 def ai_hint(request: AiHintRequest):
-    """Groq LLaMA ile çözüm ipucu üret."""
-    logger.info(f"AI ipucu isteği: {len(request.moves)} hamle, dil={request.language}")
     hint = generate_ai_hint(request.moves, request.language)
     return AiHintResponse(hint=hint)
 
-# ── Yardımcı ──────────────────────────────────────────────────────────────────
+# ── Yardımcılar ───────────────────────────────────────────────────────────────
 
 def extract_center_9(face: List[str], grid_size: int) -> List[str]:
-    """
-    Büyük bir ızgaradan merkez 3×3 bloğu çıkar.
-    Örnek: 4×3=12 kareden merkez 3×3 → 9 kare
-    """
     rows = _approx_rows(grid_size)
     cols = grid_size // rows
     matrix = [face[r * cols:(r + 1) * cols] for r in range(rows)]
-    # Merkezi bul
     start_r = (rows - 3) // 2
     start_c = (cols - 3) // 2
     result = []
@@ -224,11 +186,9 @@ def extract_center_9(face: List[str], grid_size: int) -> List[str]:
     return result
 
 def _approx_rows(size: int) -> int:
-    import math
     return max(2, round(math.sqrt(size)))
-
-# ── Giriş noktası ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
