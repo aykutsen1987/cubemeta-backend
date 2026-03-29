@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-CubeMeta Backend Solver API — v2.0
+CubeMeta Backend Solver API — v2.2
 ====================================
-FastAPI sunucusu; küp yüz verisi alarak Kociemba algoritmasıyla çözüm üretir
-ve Groq LLaMA modeli aracılığıyla AI ipuçları sağlar.
+v2.2 değişiklikleri:
+  - /api/v1/solve endpoint'ine detaylı debug logging eklendi
+  - Gelen faces verisi loglanıyor (hangi renkler geliyor?)
+  - "cubestring is invalid" hatasında daha açıklayıcı mesaj
+  - --reload FLAG KALDIRILDI (Render prod için gerekli değil, restart döngüsüne neden oluyor)
 """
 
 import os
 import logging
-import math  # _approx_rows için eklendi
+import math
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -17,7 +20,6 @@ from pydantic import BaseModel
 import kociemba
 from dotenv import load_dotenv
 
-# Groq — opsiyonel; anahtar yoksa AI ipucu devre dışı
 try:
     from groq import Groq
     GROQ_AVAILABLE = True
@@ -29,7 +31,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cubemeta")
 
-app = FastAPI(title="CubeMeta Solver API", version="2.0.0")
+app = FastAPI(title="CubeMeta Solver API", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,33 +43,47 @@ app.add_middleware(
 # ── Modeller ─────────────────────────────────────────────────────────────────
 
 class SolveRequest(BaseModel):
-    faces: List[List[str]]          # 6 yüz × N kare (3×3 için 9 kare)
-    grid_size: Optional[int] = 9    # Yüz başına kare sayısı
+    faces: List[List[str]]
+    grid_size: Optional[int] = 9
 
 class SolveResponse(BaseModel):
     solution: List[str]
     move_count: int
     error: Optional[str] = None
+    debug: Optional[str] = None   # debug bilgisi
 
 class AiHintRequest(BaseModel):
-    moves: List[str]                # Çözüm hamlelerinin listesi
-    language: Optional[str] = "tr"  # "tr" veya "en"
+    moves: List[str]
+    language: Optional[str] = "tr"
 
 class AiHintResponse(BaseModel):
     hint: str
     error: Optional[str] = None
 
-# ── Renk → Kociemba dönüşümü ─────────────────────────────────────────────────
+class HealthResponse(BaseModel):
+    status: str
+    version: str
+    groq_available: bool
+
+# ── Kociemba dönüşümü ────────────────────────────────────────────────────────
 
 def faces_to_kociemba_string(faces: List[List[str]]) -> str:
     """
-    6 yüzlük renk tablosunu kociemba formatına çevirir.
-    Kociemba sırası: U(Up) R(Right) F(Front) D(Down) L(Left) B(Back)
-    Senin uygulamanın gönderdiği sıra: [0]=Ön [1]=Arka [2]=Sol [3]=Sağ [4]=Üst [5]=Alt
+    Uygulama sırası: [0]=Ön [1]=Arka [2]=Sol [3]=Sağ [4]=Üst [5]=Alt
+    Kociemba sırası: U R F D L B
     """
     front, back, left, right, top, bottom = faces
 
-    # Merkez renkten yüz harfi eşleşmesi
+    centers = {
+        "top(U)":    top[4],
+        "right(R)":  right[4],
+        "front(F)":  front[4],
+        "bottom(D)": bottom[4],
+        "left(L)":   left[4],
+        "back(B)":   back[4],
+    }
+    logger.info(f"Merkez renkler: {centers}")
+
     try:
         color_to_face = {
             top[4]:    'U',
@@ -78,25 +94,27 @@ def faces_to_kociemba_string(faces: List[List[str]]) -> str:
             back[4]:   'B',
         }
     except IndexError:
-        raise ValueError("Yüz verileri eksik veya merkez kareler bulunamadı.")
+        raise ValueError("Yüz verileri eksik — merkez kareler bulunamadı.")
 
     if len(color_to_face) != 6:
-        raise ValueError("Yinelenen merkez rengi — geçersiz küp durumu")
+        raise ValueError(
+            f"Merkez renk çakışması! 6 farklı renk gerekli. "
+            f"Mevcut merkezler: {centers}"
+        )
 
-    # Kociemba algoritmasının beklediği özel yüz sırası (U R F D L B)
     kociemba_order = [top, right, front, bottom, left, back]
     result = ""
-    for face in kociemba_order:
+    for face_name, face in zip(["top","right","front","bottom","left","back"], kociemba_order):
         for sticker in face:
             if sticker not in color_to_face:
-                raise ValueError(f"Bilinmeyen renk kodu: {sticker}")
+                raise ValueError(f"Bilinmeyen renk kodu: '{sticker}' ({face_name} yüzünde)")
             result += color_to_face[sticker]
 
     return result
 
-# ── Groq AI ───────────────────────────────────────────────────────────────────
+# ── Groq ─────────────────────────────────────────────────────────────────────
 
-def get_groq_client() -> Optional[object]:
+def get_groq_client():
     if not GROQ_AVAILABLE:
         return None
     key = os.getenv("GROQ_API_KEY", "")
@@ -110,27 +128,22 @@ def get_groq_client() -> Optional[object]:
 def generate_ai_hint(moves: List[str], language: str = "tr") -> str:
     client = get_groq_client()
     if not client:
-        return "Groq API anahtarı sunucuda tanımlı değil. Render Environment Variables'a GROQ_API_KEY ekleyin."
-
+        return "Groq API anahtarı tanımlı değil."
     move_str = " → ".join(moves[:15])
-    more = f" ... ve {len(moves) - 15} hamle daha" if len(moves) > 15 else ""
-
+    more = f" ... ve {len(moves)-15} hamle daha" if len(moves) > 15 else ""
     if language == "tr":
-        prompt = f"Rubik Küp çözüm uzmanısın. Şu hamleleri analiz et ve kısa (3-4 cümle) Türkçe ipucu ver: {move_str}{more}"
+        prompt = f"Rubik Küp uzmanısın. Kısa Türkçe ipucu ver: {move_str}{more}"
     else:
-        prompt = f"You are a Rubik's Cube expert. Analyze these moves and give a short hint: {move_str}{more}"
-
+        prompt = f"Rubik's Cube expert. Short hint: {move_str}{more}"
     try:
         completion = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=256,
-            temperature=0.7,
+            max_tokens=256, temperature=0.7,
         )
         return completion.choices[0].message.content.strip()
     except Exception as e:
-        logger.error(f"Groq hatası: {e}")
-        return "Yapay zeka ipucu şu an kullanılamıyor."
+        return f"AI ipucu hatası: {e}"
 
 # ── Rotalar ───────────────────────────────────────────────────────────────────
 
@@ -138,52 +151,91 @@ def generate_ai_hint(moves: List[str], language: str = "tr") -> str:
 def root():
     return {
         "status": "CubeMeta Solver API çalışıyor",
-        "version": "2.0.0",
-        "groq_available": GROQ_AVAILABLE and bool(os.getenv("GROQ_API_KEY"))
+        "version": "2.2.0",
+        "groq_available": GROQ_AVAILABLE and bool(os.getenv("GROQ_API_KEY")),
+        "endpoints": ["/api/v1/health", "/api/v1/solve", "/api/v1/ai-hint"]
     }
+
+@app.get("/api/v1/health", response_model=HealthResponse)
+def health():
+    return HealthResponse(
+        status="ok",
+        version="2.2.0",
+        groq_available=GROQ_AVAILABLE and bool(os.getenv("GROQ_API_KEY"))
+    )
 
 @app.post("/api/v1/solve", response_model=SolveResponse)
 def solve(request: SolveRequest):
     if len(request.faces) != 6:
-        raise HTTPException(status_code=400, detail="Tam olarak 6 yüz gereklidir")
+        return SolveResponse(solution=[], move_count=0,
+                             error=f"6 yüz gerekli, {len(request.faces)} geldi")
 
-    grid_size = request.grid_size or 9
+    # ── Debug: gelen renkleri logla ──────────────────────────────────────────
+    face_names = ["Ön", "Arka", "Sol", "Sağ", "Üst", "Alt"]
+    color_summary = {}
+    total_colors = {}
+    for i, face in enumerate(request.faces):
+        logger.info(f"Yüz[{i}] {face_names[i]}: {face}")
+        for c in face:
+            total_colors[c] = total_colors.get(c, 0) + 1
+        color_summary[face_names[i]] = f"merkez={face[4] if len(face)>4 else '?'}"
 
-    # Izgara boyutu kontrolü ve gerekirse 3x3'e (9 kare) indirgeme
+    logger.info(f"Renk dağılımı: {total_colors}")
+    logger.info(f"Merkez özeti: {color_summary}")
+
+    # ── Renk dağılımı kontrolü ───────────────────────────────────────────────
+    white_count = total_colors.get("W", 0)
+    if white_count > 9:
+        return SolveResponse(
+            solution=[], move_count=0,
+            error=f"Renk tespiti hatası: Beyaz (W) rengi {white_count} kez sayıldı (max 9). "
+                  f"Kamera taraması yeniden yapılmalı.",
+            debug=f"Toplam renk dağılımı: {total_colors}"
+        )
+
     working_faces = request.faces
-    if grid_size != 9:
+    if (request.grid_size or 9) != 9:
         try:
-            working_faces = [extract_center_9(face, grid_size) for face in request.faces]
+            working_faces = [extract_center_9(f, request.grid_size) for f in request.faces]
         except Exception as e:
-            return SolveResponse(solution=[], move_count=0, error=f"Izgara dönüşümü hatası: {e}")
+            return SolveResponse(solution=[], move_count=0, error=f"Izgara dönüşüm hatası: {e}")
+
+    for i, face in enumerate(working_faces):
+        if len(face) != 9:
+            return SolveResponse(solution=[], move_count=0,
+                                 error=f"Yüz {i} ({face_names[i]}): 9 kare gerekli, {len(face)} var")
 
     try:
         cube_string = faces_to_kociemba_string(working_faces)
+        logger.info(f"Kociemba string ({len(cube_string)} karakter): {cube_string}")
         solution_str = kociemba.solve(cube_string)
         moves = solution_str.strip().split()
+        logger.info(f"Çözüm: {len(moves)} hamle → {moves}")
         return SolveResponse(solution=moves, move_count=len(moves))
     except Exception as e:
-        logger.error(f"Çözücü hatası: {e}")
-        return SolveResponse(solution=[], move_count=0, error=str(e))
+        error_msg = str(e)
+        logger.error(f"Çözücü hatası: {error_msg}")
+        if "invalid" in error_msg.lower():
+            return SolveResponse(
+                solution=[], move_count=0,
+                error=f"Geçersiz küp durumu: Renk dağılımı fiziksel olarak imkansız. "
+                      f"Her renkten tam 9 kare olmalı. Mevcut dağılım: {total_colors}",
+                debug=f"Kociemba hatası: {error_msg}"
+            )
+        return SolveResponse(solution=[], move_count=0, error=error_msg)
 
 @app.post("/api/v1/ai-hint", response_model=AiHintResponse)
 def ai_hint(request: AiHintRequest):
-    hint = generate_ai_hint(request.moves, request.language)
-    return AiHintResponse(hint=hint)
+    return AiHintResponse(hint=generate_ai_hint(request.moves, request.language))
 
 # ── Yardımcılar ───────────────────────────────────────────────────────────────
 
 def extract_center_9(face: List[str], grid_size: int) -> List[str]:
     rows = _approx_rows(grid_size)
     cols = grid_size // rows
-    matrix = [face[r * cols:(r + 1) * cols] for r in range(rows)]
-    start_r = (rows - 3) // 2
-    start_c = (cols - 3) // 2
-    result = []
-    for r in range(start_r, start_r + 3):
-        for c in range(start_c, start_c + 3):
-            result.append(matrix[r][c])
-    return result
+    matrix = [face[r*cols:(r+1)*cols] for r in range(rows)]
+    sr = (rows-3)//2; sc = (cols-3)//2
+    return [matrix[r][c] for r in range(sr, sr+3) for c in range(sc, sc+3)]
 
 def _approx_rows(size: int) -> int:
     return max(2, round(math.sqrt(size)))
