@@ -129,6 +129,29 @@ def solve(request: SolveRequest):
         except Exception as e:
             return SolveResponse(solution=[], move_count=0, error=f"Izgara hatası: {e}")
 
+    # ── Per-face sticker sayısı kontrolü ──────────────────────────────────────
+    for i, face in enumerate(working_faces):
+        if len(face) != 9:
+            return SolveResponse(
+                solution=[], move_count=0,
+                error=f"{FACE_NAMES[i]} yüzünde {len(face)} kare var, tam 9 olmalı."
+            )
+
+    # ── Renk dağılımı kontrolü (kociemba'dan önce net hata ver) ──────────────
+    dist_str = ", ".join(f"{k}:{v}" for k, v in sorted(total.items()))
+    wrong_colors = {k: v for k, v in total.items() if v != 9}
+    if wrong_colors:
+        bad_str = ", ".join(f"{k}={v}" for k, v in sorted(wrong_colors.items()))
+        return SolveResponse(
+            solution=[], move_count=0,
+            error=(
+                f"Renk dağılımı hatalı — her renkten tam 9 kare olmalı. "
+                f"Hatalı renkler: {bad_str}. "
+                f"Tam dağılım: {dist_str}. "
+                f"Preview ekranında renkleri düzeltin ve tekrar deneyin."
+            )
+        )
+
     try:
         cube_string = faces_to_kociemba_string(working_faces)
         solution_str = kociemba.solve(cube_string)
@@ -142,14 +165,13 @@ def solve(request: SolveRequest):
     except Exception as e:
         err = str(e)
         logger.error(f"Kociemba hatası: {err}")
-        # Kociemba "invalid" dediğinde dağılımı ekle
-        dist_str = ", ".join(f"{k}:{v}" for k, v in sorted(total.items()))
+        # Renk dağılımı doğru ama küp fiziksel olarak imkansız (twisted corner vb.)
         return SolveResponse(
             solution=[], move_count=0,
             error=(
-                f"Küp fiziksel olarak geçersiz — renk dağılımı: {dist_str}. "
-                f"Her renkten tam 9 kare olmalı. "
-                f"Preview ekranında renkleri düzeltin ve tekrar deneyin."
+                f"Küp fiziksel olarak çözülemez durumda (renk dağılımı doğru: {dist_str}). "
+                f"Küp elle karıştırılmış olabilir veya tarama sırasında yüzler yanlış yönde tutulmuş olabilir. "
+                f"Preview ekranında renkleri kontrol edip tekrar deneyin."
             )
         )
 
