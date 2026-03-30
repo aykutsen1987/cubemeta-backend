@@ -1,5 +1,5 @@
 # CubeMeta — Render.com Konfigürasyonu
-# ⚠️ --reload KALDIRDI: Production'da restart döngüsüne yol açıyordu
+# ⚠️ --reload KALDIRILDI: Production'da restart döngüsüne yol açıyordu
 
 services:
   - type: web
@@ -12,7 +12,7 @@ services:
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     plan: free
     envVars:
-      - key: GROQ_API_KEY
+      - key: ANTHROPIC_API_KEY
         sync: false
       - key: PYTHON_VERSION
         value: "3.12"
@@ -27,7 +27,7 @@ services:
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     plan: free
     envVars:
-      - key: GROQ_API_KEY
+      - key: ANTHROPIC_API_KEY
         sync: false
       - key: PYTHON_VERSION
         value: "3.12"

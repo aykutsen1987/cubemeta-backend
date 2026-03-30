@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-CubeMeta Backend Solver API — v2.3
+CubeMeta Backend Solver API — v2.4
+  - Groq yerine Anthropic Claude API ile AI ipucu
+  - Kociemba yüz sırası düzeltmesi: U R F D L B
   - Renk dağılımı "fiziksel olarak imkansız" ise açık hata mesajı
-  - Backend artık her zaman gönderilen veriyi işler (validation Android tarafında)
 """
 
 import os, logging, math
@@ -14,16 +15,16 @@ import kociemba
 from dotenv import load_dotenv
 
 try:
-    from groq import Groq
-    GROQ_AVAILABLE = True
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
 except ImportError:
-    GROQ_AVAILABLE = False
+    ANTHROPIC_AVAILABLE = False
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cubemeta")
 
-app = FastAPI(title="CubeMeta Solver API", version="2.3.0")
+app = FastAPI(title="CubeMeta Solver API", version="2.4.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 class SolveRequest(BaseModel):
@@ -46,132 +47,186 @@ class AiHintResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     version: str
-    groq_available: bool
+    ai_available: bool
 
 FACE_NAMES = ["Ön", "Arka", "Sol", "Sağ", "Üst", "Alt"]
 
+# Android toApiFormat() gönderim sırası:
+#   index 0 = FRONT, 1 = BACK, 2 = LEFT, 3 = RIGHT, 4 = TOP, 5 = BOTTOM
+# Kociemba string sırası: U R F D L B
+#   U = faces[4] (TOP), R = faces[3] (RIGHT), F = faces[0] (FRONT)
+#   D = faces[5] (BOTTOM), L = faces[2] (LEFT), B = faces[1] (BACK)
+
 def faces_to_kociemba_string(faces):
-    front, back, left, right, top, bottom = faces
-    centers = {"top": top[4], "right": right[4], "front": front[4],
-                "bottom": bottom[4], "left": left[4], "back": back[4]}
+    front  = faces[0]
+    back   = faces[1]
+    left   = faces[2]
+    right  = faces[3]
+    top    = faces[4]
+    bottom = faces[5]
+
+    centers = {
+        "U": top[4], "R": right[4], "F": front[4],
+        "D": bottom[4], "L": left[4], "B": back[4]
+    }
     logger.info(f"Merkezler: {centers}")
 
     color_to_face = {}
-    for color, letter in [(top[4],'U'),(right[4],'R'),(front[4],'F'),
-                           (bottom[4],'D'),(left[4],'L'),(back[4],'B')]:
-        if color in color_to_face:
+    for face_letter, face_data in [("U", top), ("R", right), ("F", front),
+                                     ("D", bottom), ("L", left), ("B", back)]:
+        center_color = face_data[4]
+        if center_color in color_to_face:
             raise ValueError(
-                f"Merkez renk çakışması: '{color}' birden fazla yüzde merkez. "
+                f"Merkez renk cakismasi: '{center_color}' birden fazla yuzde merkez. "
                 f"Merkezler: {centers}"
             )
-        color_to_face[color] = letter
+        color_to_face[center_color] = face_letter
 
+    # Kociemba string: U R F D L B sirasıyla her yuzun 9 karesi
     result = ""
-    for face in [top, right, front, bottom, left, back]:
-        for sticker in face:
+    for face_data in [top, right, front, bottom, left, back]:
+        for sticker in face_data:
             if sticker not in color_to_face:
-                raise ValueError(f"Bilinmeyen renk: '{sticker}'")
+                raise ValueError(
+                    f"Bilinmeyen renk: '{sticker}'. Gecerli renkler: {list(color_to_face.keys())}"
+                )
             result += color_to_face[sticker]
-    logger.info(f"Kociemba: {result}")
+
+    logger.info(f"Kociemba string ({len(result)} char): {result}")
     return result
 
-def get_groq_client():
-    if not GROQ_AVAILABLE: return None
-    key = os.getenv("GROQ_API_KEY", "")
-    if not key: return None
-    try: return Groq(api_key=key)
-    except: return None
+
+def get_anthropic_client():
+    if not ANTHROPIC_AVAILABLE:
+        return None
+    key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not key:
+        return None
+    try:
+        return anthropic.Anthropic(api_key=key)
+    except Exception:
+        return None
+
 
 def generate_ai_hint(moves, language="tr"):
-    client = get_groq_client()
+    client = get_anthropic_client()
     if not client:
-        return "Groq API anahtarı tanımlı değil."
-    move_str = " → ".join(moves[:15])
+        return "Anthropic API anahtari tanimli degil. ANTHROPIC_API_KEY ortam degiskenini ayarlayin."
+
+    move_str = " -> ".join(moves[:15])
     more = f" ... ve {len(moves)-15} hamle daha" if len(moves) > 15 else ""
-    prompt = (f"Rubik Küp uzmanısın. Kısa Türkçe ipucu ver: {move_str}{more}"
-              if language == "tr"
-              else f"Rubik's Cube expert. Short hint: {move_str}{more}")
+
+    if language == "tr":
+        prompt = (
+            f"Sen bir Rubik Kup uzmanisın. "
+            f"Asagidaki cozum adimlari icin kisa ve anlasılir Turkce bir ipucu ver. "
+            f"Maksimum 2-3 cumle olsun.\n\n"
+            f"Hamleler: {move_str}{more}\n\nIpucu:"
+        )
+    else:
+        prompt = (
+            f"You are a Rubik's Cube expert. "
+            f"Give a short, clear hint for the following solution moves. "
+            f"Maximum 2-3 sentences.\n\n"
+            f"Moves: {move_str}{more}\n\nHint:"
+        )
+
     try:
-        r = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role":"user","content":prompt}],
-            max_tokens=256, temperature=0.7)
-        return r.choices[0].message.content.strip()
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=256,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return message.content[0].text.strip()
     except Exception as e:
-        return f"AI ipucu hatası: {e}"
+        return f"AI ipucu hatasi: {e}"
+
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "2.3.0"}
+    return {"status": "ok", "version": "2.4.0"}
 
 @app.get("/api/v1/health", response_model=HealthResponse)
 def health():
-    return HealthResponse(status="ok", version="2.3.0",
-                          groq_available=GROQ_AVAILABLE and bool(os.getenv("GROQ_API_KEY")))
+    return HealthResponse(
+        status="ok",
+        version="2.4.0",
+        ai_available=ANTHROPIC_AVAILABLE and bool(os.getenv("ANTHROPIC_API_KEY"))
+    )
 
 @app.post("/api/v1/solve", response_model=SolveResponse)
 def solve(request: SolveRequest):
     if len(request.faces) != 6:
         return SolveResponse(solution=[], move_count=0,
-                             error=f"6 yüz gerekli, {len(request.faces)} geldi")
+                             error=f"6 yuz gerekli, {len(request.faces)} geldi")
 
-    # Renk dağılımı logu
     total = {}
     for i, face in enumerate(request.faces):
-        logger.info(f"Yüz[{i}] {FACE_NAMES[i]}: {face}")
-        for c in face: total[c] = total.get(c, 0) + 1
-    logger.info(f"Dağılım: {total}")
+        logger.info(f"Yuz[{i}] {FACE_NAMES[i]}: {face}")
+        for c in face:
+            total[c] = total.get(c, 0) + 1
+    logger.info(f"Dagilim: {total}")
 
     working_faces = request.faces
     if (request.grid_size or 9) != 9:
         try:
             working_faces = [extract_center_9(f, request.grid_size) for f in request.faces]
         except Exception as e:
-            return SolveResponse(solution=[], move_count=0, error=f"Izgara hatası: {e}")
+            return SolveResponse(solution=[], move_count=0, error=f"Izgara hatasi: {e}")
 
-    # ── Per-face sticker sayısı kontrolü ──────────────────────────────────────
     for i, face in enumerate(working_faces):
         if len(face) != 9:
             return SolveResponse(
                 solution=[], move_count=0,
-                error=f"{FACE_NAMES[i]} yüzünde {len(face)} kare var, tam 9 olmalı."
+                error=f"{FACE_NAMES[i]} yuzunde {len(face)} kare var, tam 9 olmali."
             )
 
-    # ── Renk dağılımı kontrolü (kociemba'dan önce net hata ver) ──────────────
     dist_str = ", ".join(f"{k}:{v}" for k, v in sorted(total.items()))
     wrong_colors = {k: v for k, v in total.items() if v != 9}
     if wrong_colors:
         bad_str = ", ".join(f"{k}={v}" for k, v in sorted(wrong_colors.items()))
+        missing = [c for c in ["R", "G", "B", "Y", "O", "W"] if c not in total]
+        missing_str = (f" Eksik renkler: {', '.join(missing)}." if missing else "")
         return SolveResponse(
             solution=[], move_count=0,
             error=(
-                f"Renk dağılımı hatalı — her renkten tam 9 kare olmalı. "
-                f"Hatalı renkler: {bad_str}. "
-                f"Tam dağılım: {dist_str}. "
-                f"Preview ekranında renkleri düzeltin ve tekrar deneyin."
+                f"Renk dagilimi hatali - her renkten tam 9 kare olmali. "
+                f"Hatali renkler: {bad_str}.{missing_str} "
+                f"Preview ekraninda tum renkleri manuel duzeltın."
             )
         )
 
     try:
         cube_string = faces_to_kociemba_string(working_faces)
         solution_str = kociemba.solve(cube_string)
+
+        if not solution_str or solution_str.startswith("Error") or not solution_str.strip():
+            logger.error(f"Kociemba hata stringi: {solution_str!r}")
+            return SolveResponse(
+                solution=[], move_count=0,
+                error=(
+                    f"Kup durumu cozulemez. Preview ekraninda renkleri kontrol edin. "
+                    f"Her yuzun merkez karesi o yuzun rengini temsil etmeli. "
+                    f"(Kociemba: {str(solution_str).strip()})"
+                )
+            )
+
         moves = solution_str.strip().split()
-        logger.info(f"Çözüm: {len(moves)} hamle")
+        logger.info(f"Cozum: {len(moves)} hamle - {solution_str.strip()}")
         return SolveResponse(solution=moves, move_count=len(moves))
+
     except ValueError as e:
-        # Merkez çakışması veya bilinmeyen renk — kullanıcıya göster
-        logger.error(f"Veri hatası: {e}")
+        logger.error(f"Veri hatasi: {e}")
         return SolveResponse(solution=[], move_count=0, error=str(e))
     except Exception as e:
         err = str(e)
-        logger.error(f"Kociemba hatası: {err}")
-        # Renk dağılımı doğru ama küp fiziksel olarak imkansız (twisted corner vb.)
+        logger.error(f"Kociemba hatasi: {err}")
         return SolveResponse(
             solution=[], move_count=0,
             error=(
-                f"Küp fiziksel olarak çözülemez durumda (renk dağılımı doğru: {dist_str}). "
-                f"Küp elle karıştırılmış olabilir veya tarama sırasında yüzler yanlış yönde tutulmuş olabilir. "
-                f"Preview ekranında renkleri kontrol edip tekrar deneyin."
+                f"Kup fiziksel olarak cozulemez durumda (renk dagilimi dogru: {dist_str}). "
+                f"Kup elle karistirilmis olabilir veya tarama sirasinda yuzler yanlis yonde tutulmus olabilir. "
+                f"Preview ekraninda renkleri kontrol edip tekrar deneyin."
             )
         )
 
