@@ -1,0 +1,33 @@
+# CubeMeta — Render.com Konfigürasyonu
+# ⚠️ --reload KALDIRDI: Production'da restart döngüsüne yol açıyordu
+
+services:
+  - type: web
+    name: cubemeta-backend-a
+    runtime: python
+    repo: https://github.com/KULLANICI_ADINIZ/CubeMeta
+    branch: main
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    plan: free
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.12"
+
+  - type: web
+    name: cubemeta-backend-b
+    runtime: python
+    repo: https://github.com/KULLANICI_ADINIZ/CubeMeta
+    branch: main
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    plan: free
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.12"
